@@ -1,0 +1,293 @@
+# -*- coding: utf-8 -*-
+"""
+Auto-generated Spider -- 5 curl(s) / 2 API group(s)
+Dependencies: pip install curl_cffi
+Run:         python this_file.py
+"""
+
+import random, time, json, logging, threading
+from typing import Optional, Dict, Any, List, Tuple
+from urllib.parse import urljoin
+
+import curl_cffi.requests as requests
+
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S")
+log = logging.getLogger("Spider")
+
+
+class SpiderConfig:
+    """Global config --- all knobs here."""
+
+    USER_AGENTS: List[str] = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    ]
+    MIN_DELAY: float = 1.0
+    MAX_DELAY: float = 3.0
+    MAX_RETRIES: int = 3
+    RETRY_BACKOFF_FACTOR: float = 2.0
+    RETRY_STATUS_CODES: Tuple[int, ...] = (429, 500, 502, 503, 504)
+    PROXY: Optional[str] = None
+    IMPERSONATE: str = "chrome124"
+    REQUESTS_PER_SECOND: float = 2.0
+    TIMEOUT: int = 30
+    DEFAULT_HEADERS: Dict[str, str] = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Cache-Control": "max-age=0",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+    }
+
+
+class RateLimiter:
+    def __init__(self, rate: float):
+        self._interval = 1.0/rate if rate > 0 else 0
+        self._lock = threading.Lock(); self._last = 0.0
+    def acquire(self):
+        if self._interval <= 0: return
+        with self._lock:
+            now = time.monotonic(); w = self._interval-(now-self._last)
+            if w > 0: time.sleep(w); self._last = time.monotonic()
+            else: self._last = now
+
+
+class BaseSpider:
+    def __init__(self, config=None):
+        self.config = config or SpiderConfig()
+        self._limiter = RateLimiter(self.config.REQUESTS_PER_SECOND)
+        self._session = None; self._init_session()
+    def _init_session(self):
+        self._session = requests.Session(impersonate=self.config.IMPERSONATE)
+    @property
+    def session(self):
+        if self._session is None: self._init_session()
+        return self._session
+    def close(self):
+        if self._session: self._session.close(); self._session = None
+    def __enter__(self): return self
+    def __exit__(self, *a): self.close()
+    def _random_ua(self):
+        return random.choice(self.config.USER_AGENTS)
+    def _random_delay(self):
+        time.sleep(random.uniform(self.config.MIN_DELAY, self.config.MAX_DELAY))
+    def _build_kwargs(self, **kw):
+        mh = {**self.config.DEFAULT_HEADERS, **kw.pop("headers", {})}
+        mh["User-Agent"] = self._random_ua()
+        kw["headers"] = mh
+        kw["impersonate"] = self.config.IMPERSONATE
+        kw.setdefault("timeout", self.config.TIMEOUT)
+        if self.config.PROXY:
+            kw["proxies"] = {"http": self.config.PROXY, "https": self.config.PROXY}
+        return kw
+    def request(self, method, url, **kw):
+        kw = self._build_kwargs(**kw)
+        last_exc = None
+        for attempt in range(self.config.MAX_RETRIES + 1):
+            try:
+                self._limiter.acquire(); self._random_delay()
+                resp = self.session.request(method, url, **kw)
+                if resp.status_code in self.config.RETRY_STATUS_CODES:
+                    if attempt < self.config.MAX_RETRIES:
+                        bo = self.config.RETRY_BACKOFF_FACTOR**(attempt+1)
+                        log.warning("Retry %d/%d [%s %s] status=%d backoff=%.1fs",
+                                    attempt+1, self.config.MAX_RETRIES, method, url, resp.status_code, bo)
+                        time.sleep(bo); continue
+                resp.raise_for_status(); return resp
+            except requests.RequestsError as exc:
+                last_exc = exc
+                if attempt < self.config.MAX_RETRIES:
+                    bo = self.config.RETRY_BACKOFF_FACTOR**(attempt+1)
+                    log.warning("Retry %d/%d [%s %s] %s backoff=%.1fs",
+                                attempt+1, self.config.MAX_RETRIES, method, url, exc, bo)
+                    time.sleep(bo)
+                else: raise
+        raise last_exc
+    def get(self, url, **kw):    return self.request("GET", url, **kw)
+    def post(self, url, **kw):   return self.request("POST", url, **kw)
+
+
+# ============================================================================
+# API classes  (auto-generated -- do not edit)
+# ============================================================================
+class httpbin_org_API(BaseSpider):
+    """API -- https://httpbin.org"""
+    BASE_URL = "https://httpbin.org"
+
+    def fetch_get(self, page=None, limit=None, sort=None):
+        """
+        GET https://httpbin.org/get
+
+        Headers:
+            Accept: application/json, text/plain, */*
+            Accept-Language: zh-CN,zh;q=0.9,en;q=0.8
+            Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dummy
+            Connection: keep-alive
+            Referer: https://httpbin.org/
+        Params: {'page': '1', 'limit': '20', 'sort': 'desc'}
+        """
+        url = urljoin(self.BASE_URL, "/get")
+
+        _headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Authorization": "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dummy",
+            "Connection": "keep-alive",
+            "Referer": "https://httpbin.org/",
+        }
+
+        _params = {k: v for k, v in [("page", page), ("limit", limit), ("sort", sort)] if v is not None}
+
+        _cookies = {}
+
+        log.debug("[httpbin_org_API] GET %s", url)
+        return self.request("get", url, headers=_headers, params=_params, cookies=_cookies)
+
+    def create_post(self, data: dict = None):
+        """
+        POST https://httpbin.org/post
+
+        Headers:
+            Accept: application/json
+            Content-Type: application/json
+            Origin: https://httpbin.org
+        Body: {"username":"admin","password":"secret123","remember":true}
+        """
+        url = urljoin(self.BASE_URL, "/post")
+
+        _headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Origin": "https://httpbin.org",
+        }
+
+        _params = {}
+
+        _cookies = {}
+
+        log.debug("[httpbin_org_API] POST %s", url)
+        return self.request("post", url, headers=_headers, params=_params, cookies=_cookies, json=data)
+
+    def fetch_cookies(self):
+        """
+        GET https://httpbin.org/cookies
+
+        Headers:
+            Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+        """
+        url = urljoin(self.BASE_URL, "/cookies")
+
+        _headers = {
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+
+        _params = {}
+
+        _cookies = {}
+
+        log.debug("[httpbin_org_API] GET %s", url)
+        return self.request("get", url, headers=_headers, params=_params, cookies=_cookies)
+
+
+class jsonplaceholder_typicode_com_API(BaseSpider):
+    """API -- https://jsonplaceholder.typicode.com"""
+    BASE_URL = "https://jsonplaceholder.typicode.com"
+
+    def fetch_posts_comments(self):
+        """
+        GET https://jsonplaceholder.typicode.com/posts/1/comments
+
+        Headers:
+            Accept: application/json
+        """
+        url = urljoin(self.BASE_URL, "/posts/1/comments")
+
+        _headers = {
+            "Accept": "application/json",
+        }
+
+        _params = {}
+
+        _cookies = {}
+
+        log.debug("[jsonplaceholder_typicode_com_API] GET %s", url)
+        return self.request("get", url, headers=_headers, params=_params, cookies=_cookies)
+
+    def create_posts(self, data: dict = None):
+        """
+        POST https://jsonplaceholder.typicode.com/posts
+
+        Headers:
+            Content-Type: application/json; charset=UTF-8
+            Accept: application/json
+        Body: {"title":"foo","body":"bar","userId":1}
+        """
+        url = urljoin(self.BASE_URL, "/posts")
+
+        _headers = {
+            "Content-Type": "application/json; charset=UTF-8",
+            "Accept": "application/json",
+        }
+
+        _params = {}
+
+        _cookies = {}
+
+        log.debug("[jsonplaceholder_typicode_com_API] POST %s", url)
+        return self.request("post", url, headers=_headers, params=_params, cookies=_cookies, json=data)
+
+
+
+# ============================================================================
+# SpiderClient
+# ============================================================================
+
+class SpiderClient:
+    def __init__(self, config=None):
+        self.config = config or SpiderConfig()
+        self.api_httpbin_org = httpbin_org_API(self.config)
+        self.api_jsonplaceholder_typicode_com = jsonplaceholder_typicode_com_API(self.config)
+    def close(self):
+        self.api_httpbin_org.close()
+        self.api_jsonplaceholder_typicode_com.close()
+    def __enter__(self): return self
+    def __exit__(self, *a): self.close()
+
+
+# ============================================================================
+# main
+# ============================================================================
+
+def main():
+    """Run all APIs once for verification. Comment out unwanted calls."""
+    config = SpiderConfig()
+    # config.PROXY = "http://127.0.0.1:7890"
+    # config.IMPERSONATE = "firefox120"
+    with SpiderClient(config) as spider:
+        # ── GET https://httpbin.org/get ──
+        resp = spider.api_httpbin_org.fetch_get(page="1", limit="20", sort="desc")
+        log.info("fetch_get -> status=%d", resp.status_code)
+        log.info("  body: %s", resp.text)
+
+        # ── GET https://jsonplaceholder.typicode.com/posts/1/comments ──
+        resp = spider.api_jsonplaceholder_typicode_com.fetch_posts_comments()
+        log.info("fetch_posts_comments -> status=%d", resp.status_code)
+        log.info("  body: %s", resp.text)
+
+    log.info("All requests completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
